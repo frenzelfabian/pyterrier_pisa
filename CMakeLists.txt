@@ -8,12 +8,19 @@ set(CMAKE_CXX_EXTENSIONS ON)
 
 # Detect target architecture once and set portable flags. The submodule's own
 # CMakeLists files append `-march=native` later (we patch that out below), so
-# these flags determine what actually gets used.
+# these flags must cover everything the C and C++ submodule sources need:
+# MaskedVByte's varintdecode.c uses SSE3/SSSE3/SSE4.1 intrinsics, simdcomp
+# uses SSE2, FastPFor uses SSE2/AVX2. `-msse4.2` implies SSE3/SSSE3/SSE4.1,
+# so the bundle below covers all of them. CRITICAL: set both C and CXX flags;
+# C-only flag was the missing piece in the previous iteration.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(amd64)|(AMD64)")
     set(_PISA_ARCH_X86 ON)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mtune=generic -march=x86-64 -msse4.2 -mavx -mavx2 -mfma -mbmi -mrdseed -mpopcnt")
+    set(_pisa_x86_flags "-mtune=generic -march=x86-64 -msse4.2 -mavx -mavx2 -mfma -mbmi -mpopcnt")
+    set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} ${_pisa_x86_flags}")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${_pisa_x86_flags}")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64)|(arm64)|(ARM64)")
     set(_PISA_ARCH_X86 OFF)
+    set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} -mtune=generic")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mtune=generic")
 else()
     set(_PISA_ARCH_X86 OFF)
