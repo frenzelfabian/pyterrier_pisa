@@ -221,12 +221,25 @@ size_t vbyte_encode_delta(uint32_t *in, size_t length, uint8_t *bout, uint32_t p
     _pisa_write_if_changed("${_sc}/src/simdcomputil.c" "/* PISA_ARM_STUB: no SSE2 */\n")
   endif()
 
-  # FastPFor: SSE2/AVX2 (immintrin.h) → empty stubs for the bitpacking sources.
+  # FastPFor: SSE2/AVX2 (immintrin.h) — none of its sources can compile on
+  # aarch64. Replace its CMakeLists with a minimal stub that creates an empty
+  # STATIC library exposing only the headers directory, so dependents that
+  # link against FastPFor and `target_compile_options(FastPFor PRIVATE ...)`
+  # in pisa/external/CMakeLists.txt still work. PISA's own codec sources that
+  # would call into FastPFor are themselves replaced below with interpolative
+  # fallbacks, so the empty library has no callers.
   set(_fp "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/FastPFor")
   if(IS_DIRECTORY "${_fp}")
-    foreach(_f "bitpackingaligned" "bitpacking" "bitpackingunaligned" "simdbitpacking")
-      _pisa_write_if_changed("${_fp}/src/${_f}.cpp" "/* PISA_ARM_STUB: no SSE2/AVX2 */\n")
-    endforeach()
+    _pisa_write_if_changed("${_fp}/fastpfor_arm_stub.cpp"
+        "/* PISA_ARM_STUB: empty translation unit so FastPFor STATIC has at least one source. */\n")
+    _pisa_write_if_changed("${_fp}/CMakeLists.txt" [=[
+# PISA_ARM_STUB: replaces upstream FastPFor CMakeLists on aarch64 because all
+# of the bitpacking sources require x86 SIMD intrinsics (immintrin.h).
+cmake_minimum_required(VERSION 3.5)
+project(FastPFor CXX)
+add_library(FastPFor STATIC fastpfor_arm_stub.cpp)
+target_include_directories(FastPFor PUBLIC headers)
+]=])
   endif()
 
   # PISA codec sources that depend on the SIMD libs above. Replace each with
