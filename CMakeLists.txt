@@ -6,11 +6,17 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS ON)
 
-# Architecture-specific compiler flags. SSE/AVX intrinsics only exist on x86.
+# Detect target architecture once and set portable flags. The submodule's own
+# CMakeLists files append `-march=native` later (we patch that out below), so
+# these flags determine what actually gets used.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(amd64)|(AMD64)")
+    set(_PISA_ARCH_X86 ON)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mtune=generic -march=x86-64 -msse4.2 -mavx -mavx2 -mfma -mbmi -mrdseed -mpopcnt")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64)|(arm64)|(ARM64)")
+    set(_PISA_ARCH_X86 OFF)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mtune=generic")
+else()
+    set(_PISA_ARCH_X86 OFF)
 endif()
 
 # Speed up the build by removing CLI tools, tests, and benchmarks
@@ -21,30 +27,96 @@ set(PISA_ENABLE_BENCHMARKING OFF CACHE BOOL "" FORCE)
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module NumPy)
 include_directories(${Python_NumPy_INCLUDE_DIRS})
 
-# Guard x86-only SIMD headers so PISA compiles on aarch64 as well.
-foreach(_file
-    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/util/intrinsics.hpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/VarIntG8IU.h")
-  if(EXISTS "${_file}")
-    file(READ "${_file}" _content)
-    if(_content MATCHES "#include <x86intrin\\.h>")
-      string(REGEX REPLACE
-        "(#include <x86intrin\\.h>)"
-        "#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)\n\\1\n#endif"
-        _content "${_content}")
-      file(WRITE "${_file}" "${_content}")
-      message(STATUS "ARM patch applied: ${_file}")
-    endif()
-  endif()
-endforeach()
+# ---------------------------------------------------------------------------
+# Idempotent patching helpers
+#
+# The submodule pisa/ ships sources that assume x86 (SSE/AVX intrinsics).
+# To make builds work on aarch64 we patch a few headers/sources at configure
+# time. These patches MUST be idempotent: CMake reconfigures repeatedly
+# during builds, and a non-idempotent patch ends up nesting guards or
+# bumping file mtimes on every run, which triggers spurious rebuilds and,
+# in some cases, slowly corrupts the file.
+# ---------------------------------------------------------------------------
 
-# On non-x86, replace MaskedVByte sources with portable scalar VByte implementations.
-# MaskedVByte uses SSE4.1/AVX2 SIMD that does not exist on aarch64.
-if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(amd64)|(AMD64)")
+# Write `_content` to `_path` only if the existing file differs. Avoids
+# bumping mtimes on every reconfigure.
+function(_pisa_write_if_changed _path _content)
+    set(_existing "")
+    if(EXISTS "${_path}")
+        file(READ "${_path}" _existing)
+    endif()
+    if(NOT _existing STREQUAL "${_content}")
+        file(WRITE "${_path}" "${_content}")
+        message(STATUS "pyterrier_pisa: wrote ${_path}")
+    endif()
+endfunction()
+
+# Wrap `#include <x86intrin.h>` in an architecture guard. Idempotent: looks
+# at the bytes preceding the include and skips if `__x86_64__` already guards
+# it.
+function(_pisa_guard_x86intrin _file)
+    if(NOT EXISTS "${_file}")
+        return()
+    endif()
+    file(READ "${_file}" _content)
+    string(FIND "${_content}" "#include <x86intrin.h>" _inc_pos)
+    if(_inc_pos LESS 0)
+        return()
+    endif()
+    string(SUBSTRING "${_content}" 0 ${_inc_pos} _before)
+    if(_before MATCHES "defined\\(__x86_64__\\)")
+        # Already guarded — nothing to do.
+        return()
+    endif()
+    string(REGEX REPLACE
+        "#include <x86intrin\\.h>"
+        "#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)\n#include <x86intrin.h>\n#endif"
+        _content "${_content}")
+    file(WRITE "${_file}" "${_content}")
+    message(STATUS "pyterrier_pisa: ARM guard applied to ${_file}")
+endfunction()
+
+# Drop unconditional `-march=native` lines from the submodule CMakeLists files.
+# The parent already sets portable arch flags above; `-march=native` overrides
+# them and breaks reproducible/portable builds. Idempotent: if no match found,
+# nothing is rewritten.
+function(_pisa_strip_march_native _file)
+    if(NOT EXISTS "${_file}")
+        return()
+    endif()
+    file(READ "${_file}" _content)
+    string(REGEX REPLACE
+        "set\\(CMAKE_(C|CXX)_FLAGS \"\\\$\\{CMAKE_(C|CXX)_FLAGS\\} -march=native\"\\)"
+        "# (-march=native removed; arch flags set by parent CMakeLists)"
+        _new "${_content}")
+    if(NOT _new STREQUAL "${_content}")
+        file(WRITE "${_file}" "${_new}")
+        message(STATUS "pyterrier_pisa: stripped -march=native from ${_file}")
+    endif()
+endfunction()
+
+# Apply x86intrin guards.
+_pisa_guard_x86intrin("${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/util/intrinsics.hpp")
+_pisa_guard_x86intrin("${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/VarIntG8IU.h")
+
+# Strip redundant -march=native from submodule CMakeLists.
+_pisa_strip_march_native("${CMAKE_CURRENT_SOURCE_DIR}/pisa/CMakeLists.txt")
+_pisa_strip_march_native("${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/CMakeLists.txt")
+
+# ---------------------------------------------------------------------------
+# Architecture-specific source replacements (non-x86 only)
+#
+# On aarch64, several SIMD libraries don't compile because they rely on x86
+# intrinsics (SSE/AVX). For each, we replace the offending sources with a
+# portable fallback (or empty stub if the symbols aren't actually called).
+# All writes go through _pisa_write_if_changed for idempotency.
+# ---------------------------------------------------------------------------
+if(NOT _PISA_ARCH_X86)
+  # MaskedVByte: SSE4.1/AVX2 → portable scalar VByte.
   set(_mb "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/MaskedVByte")
   if(IS_DIRECTORY "${_mb}")
-    message(STATUS "Replacing MaskedVByte with portable scalar implementation for non-x86")
-    file(WRITE "${_mb}/src/varintdecode.c" [=[
+    _pisa_write_if_changed("${_mb}/src/varintdecode.c" [=[
+/* PISA_ARM_STUB: portable scalar replacement for MaskedVByte SSE/AVX code. */
 #include <stdint.h>
 #include <stddef.h>
 #include "../include/varintdecode.h"
@@ -108,7 +180,8 @@ int masked_vbyte_search_delta(const uint8_t *in, uint64_t length, uint32_t prev,
     return -1;
 }
 ]=])
-    file(WRITE "${_mb}/src/varintencode.c" [=[
+    _pisa_write_if_changed("${_mb}/src/varintencode.c" [=[
+/* PISA_ARM_STUB: portable scalar replacement for MaskedVByte SSE/AVX code. */
 #include <stdint.h>
 #include <stddef.h>
 #include "../include/varintencode.h"
@@ -132,21 +205,29 @@ size_t vbyte_encode_delta(uint32_t *in, size_t length, uint8_t *bout, uint32_t p
 }
 ]=])
   endif()
-endif()
 
-# On non-x86, replace simdcomp C sources with empty stubs and simdbp.cpp with
-# an interpolative fallback. simdcomp uses SSE2 (__m128i) types that don't exist on aarch64.
-if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(amd64)|(AMD64)")
+  # simdcomp: SSE2 (__m128i) → empty stubs (symbols aren't reached on ARM
+  # because SimdBpBlockCodec is replaced below with an interpolative fallback).
   set(_sc "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/simdcomp")
   if(IS_DIRECTORY "${_sc}")
-    message(STATUS "Replacing simdcomp with empty stubs for non-x86")
-    file(WRITE "${_sc}/src/simdbitpacking.c" "/* ARM stub: no SSE2 */\n")
-    file(WRITE "${_sc}/src/simdcomputil.c" "/* ARM stub: no SSE2 */\n")
+    _pisa_write_if_changed("${_sc}/src/simdbitpacking.c" "/* PISA_ARM_STUB: no SSE2 */\n")
+    _pisa_write_if_changed("${_sc}/src/simdcomputil.c" "/* PISA_ARM_STUB: no SSE2 */\n")
   endif()
-  set(_simdbp "${CMAKE_CURRENT_SOURCE_DIR}/pisa/src/codec/simdbp.cpp")
-  if(EXISTS "${_simdbp}")
-    message(STATUS "Replacing simdbp.cpp with interpolative fallback for non-x86")
-    file(WRITE "${_simdbp}" [=[
+
+  # FastPFor: SSE2/AVX2 (immintrin.h) → empty stubs for the bitpacking sources.
+  set(_fp "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/FastPFor")
+  if(IS_DIRECTORY "${_fp}")
+    foreach(_f "bitpackingaligned" "bitpacking" "bitpackingunaligned" "simdbitpacking")
+      _pisa_write_if_changed("${_fp}/src/${_f}.cpp" "/* PISA_ARM_STUB: no SSE2/AVX2 */\n")
+    endforeach()
+  endif()
+
+  # PISA codec sources that depend on the SIMD libs above. Replace each with
+  # an interpolative fallback so the symbols still link.
+  _pisa_write_if_changed(
+      "${CMAKE_CURRENT_SOURCE_DIR}/pisa/src/codec/simdbp.cpp"
+      [=[
+/* PISA_ARM_STUB: interpolative fallback for SimdBpBlockCodec. */
 #include "codec/simdbp.hpp"
 #include "codec/block_codecs.hpp"
 namespace pisa {
@@ -162,23 +243,13 @@ SimdBpBlockCodec::decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_value
 }
 }  // namespace pisa
 ]=])
-  endif()
 
-  # FastPFor uses SSE2/AVX2 intrinsics (immintrin.h) that don't exist on aarch64.
-  # Replace the three compiled bitpacking source files with empty stubs so the
-  # FastPFor STATIC library target compiles, then replace the PISA codec files
-  # that use FastPFor types with interpolative fallbacks.
-  set(_fp "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/FastPFor")
-  if(IS_DIRECTORY "${_fp}")
-    message(STATUS "Replacing FastPFor compiled sources with empty stubs for non-x86")
-    foreach(_f "bitpackingaligned" "bitpacking" "bitpackingunaligned" "simdbitpacking")
-      file(WRITE "${_fp}/src/${_f}.cpp" "/* ARM stub: no SSE2/AVX2 */\n")
-    endforeach()
-  endif()
-  set(_optpfor_hpp "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/optpfor.hpp")
-  if(EXISTS "${_optpfor_hpp}")
-    message(STATUS "Replacing optpfor.hpp with ARM-safe stub for non-x86")
-    file(WRITE "${_optpfor_hpp}" [=[
+  # OptPFor's header pulls in FastPFor types. Replace with an ARM-safe stub
+  # whose .cpp uses an interpolative fallback.
+  _pisa_write_if_changed(
+      "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/optpfor.hpp"
+      [=[
+/* PISA_ARM_STUB: header without FastPFor SIMD dependency. */
 #pragma once
 #include <vector>
 #include "codec/block_codec.hpp"
@@ -195,31 +266,63 @@ class OptPForBlockCodec: public BlockCodec {
 };
 }  // namespace pisa
 ]=])
-  endif()
-  foreach(_codec "optpfor;OptPForBlockCodec;optpfor" "simple8b;Simple8bBlockCodec;simple8b" "simple16;Simple16BlockCodec;simple16")
-    list(GET _codec 0 _name)
-    list(GET _codec 1 _classname)
-    list(GET _codec 2 _hdr)
-    set(_f "${CMAKE_CURRENT_SOURCE_DIR}/pisa/src/codec/${_name}.cpp")
-    if(EXISTS "${_f}")
-      message(STATUS "Replacing ${_name}.cpp with interpolative fallback for non-x86")
-      file(WRITE "${_f}" "#include \"codec/${_hdr}.hpp\"\n#include \"codec/block_codecs.hpp\"\nnamespace pisa {\nvoid ${_classname}::encode(uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out) const {\n    auto* src = const_cast<uint32_t*>(in);\n    interpolative_block::encode(src, sum_of_values, n, out);\n}\nuint8_t const* ${_classname}::decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n) const {\n    return interpolative_block::decode(in, out, sum_of_values, n);\n}\n}  // namespace pisa\n")
-    endif()
+
+  # Codec .cpp files that compile against the now-stubbed SIMD libs. Each is
+  # replaced with an interpolative fallback. Format: "name:class:header" —
+  # using ':' as the inner separator because CMake list semantics flatten
+  # nested ';' lists.
+  set(_codec_specs
+      "optpfor:OptPForBlockCodec:optpfor"
+      "simple8b:Simple8bBlockCodec:simple8b"
+      "simple16:Simple16BlockCodec:simple16"
+  )
+  foreach(_spec IN LISTS _codec_specs)
+    string(REGEX MATCHALL "[^:]+" _parts "${_spec}")
+    list(GET _parts 0 _name)
+    list(GET _parts 1 _classname)
+    list(GET _parts 2 _hdr)
+    set(_target "${CMAKE_CURRENT_SOURCE_DIR}/pisa/src/codec/${_name}.cpp")
+    set(_codec_body
+"/* PISA_ARM_STUB: interpolative fallback for ${_classname}. */
+#include \"codec/${_hdr}.hpp\"
+#include \"codec/block_codecs.hpp\"
+namespace pisa {
+void ${_classname}::encode(uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out) const {
+    auto* src = const_cast<uint32_t*>(in);
+    interpolative_block::encode(src, sum_of_values, n, out);
+}
+uint8_t const* ${_classname}::decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n) const {
+    return interpolative_block::decode(in, out, sum_of_values, n);
+}
+}  // namespace pisa
+")
+    _pisa_write_if_changed("${_target}" "${_codec_body}")
   endforeach()
 
-  # QMX uses SSE4.1/SSE4.2 intrinsics. Replace its CMakeLists.txt with a no-op
-  # INTERFACE library so the target exists without compiling any SIMD sources,
-  # and replace qmx.cpp with an interpolative fallback.
+  # QMX uses SSE4.1/SSE4.2 intrinsics. Replace its CMakeLists with a no-op
+  # INTERFACE library so the target exists without compiling SIMD sources,
+  # then replace qmx.cpp with an interpolative fallback.
   set(_qmx_dir "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/QMX")
   if(IS_DIRECTORY "${_qmx_dir}")
-    message(STATUS "Replacing QMX with empty INTERFACE library for non-x86")
-    file(WRITE "${_qmx_dir}/CMakeLists.txt" "add_library(QMX INTERFACE)\n")
+    _pisa_write_if_changed("${_qmx_dir}/CMakeLists.txt"
+        "# PISA_ARM_STUB: no SSE4 on aarch64\nadd_library(QMX INTERFACE)\n")
   endif()
-  set(_qmx_cpp "${CMAKE_CURRENT_SOURCE_DIR}/pisa/src/codec/qmx.cpp")
-  if(EXISTS "${_qmx_cpp}")
-    message(STATUS "Replacing qmx.cpp with interpolative fallback for non-x86")
-    file(WRITE "${_qmx_cpp}" "#include \"codec/qmx.hpp\"\n#include \"codec/block_codecs.hpp\"\nnamespace pisa {\nvoid QmxBlockCodec::encode(uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out) const {\n    auto* src = const_cast<uint32_t*>(in);\n    interpolative_block::encode(src, sum_of_values, n, out);\n}\nuint8_t const* QmxBlockCodec::decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n) const {\n    return interpolative_block::decode(in, out, sum_of_values, n);\n}\n}  // namespace pisa\n")
-  endif()
+  _pisa_write_if_changed(
+      "${CMAKE_CURRENT_SOURCE_DIR}/pisa/src/codec/qmx.cpp"
+      [=[
+/* PISA_ARM_STUB: interpolative fallback for QmxBlockCodec. */
+#include "codec/qmx.hpp"
+#include "codec/block_codecs.hpp"
+namespace pisa {
+void QmxBlockCodec::encode(uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out) const {
+    auto* src = const_cast<uint32_t*>(in);
+    interpolative_block::encode(src, sum_of_values, n, out);
+}
+uint8_t const* QmxBlockCodec::decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n) const {
+    return interpolative_block::decode(in, out, sum_of_values, n);
+}
+}  // namespace pisa
+]=])
 endif()
 
 add_subdirectory(pisa)
