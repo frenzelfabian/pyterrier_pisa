@@ -171,7 +171,7 @@ SimdBpBlockCodec::decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_value
   set(_fp "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/FastPFor")
   if(IS_DIRECTORY "${_fp}")
     message(STATUS "Replacing FastPFor compiled sources with empty stubs for non-x86")
-    foreach(_f "bitpackingaligned" "bitpacking" "bitpackingunaligned")
+    foreach(_f "bitpackingaligned" "bitpacking" "bitpackingunaligned" "simdbitpacking")
       file(WRITE "${_fp}/src/${_f}.cpp" "/* ARM stub: no SSE2/AVX2 */\n")
     endforeach()
   endif()
