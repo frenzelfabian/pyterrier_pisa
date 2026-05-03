@@ -21,6 +21,24 @@ set(PISA_ENABLE_BENCHMARKING OFF CACHE BOOL "" FORCE)
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module NumPy)
 include_directories(${Python_NumPy_INCLUDE_DIRS})
 
+# Guard x86-only SIMD headers so PISA compiles on aarch64 as well.
+# These are patches to upstream files that haven't been fixed yet.
+foreach(_file
+    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/util/intrinsics.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/VarIntG8IU.h")
+  if(EXISTS "${_file}")
+    file(READ "${_file}" _content)
+    if(_content MATCHES "#include <x86intrin\\.h>")
+      string(REGEX REPLACE
+        "(#include <x86intrin\\.h>)"
+        "#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)\n\\1\n#endif"
+        _content "${_content}")
+      file(WRITE "${_file}" "${_content}")
+      message(STATUS "ARM patch applied: ${_file}")
+    endif()
+  endif()
+endforeach()
+
 add_subdirectory(pisa)
 
 Python_add_library(_pisathon MODULE src/pyterrier_pisa/_pisathon.cpp WITH_SOABI)
