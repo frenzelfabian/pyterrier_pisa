@@ -134,6 +134,37 @@ size_t vbyte_encode_delta(uint32_t *in, size_t length, uint8_t *bout, uint32_t p
   endif()
 endif()
 
+# On non-x86, replace simdcomp C sources with empty stubs and simdbp.cpp with
+# an interpolative fallback. simdcomp uses SSE2 (__m128i) types that don't exist on aarch64.
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(amd64)|(AMD64)")
+  set(_sc "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/simdcomp")
+  if(IS_DIRECTORY "${_sc}")
+    message(STATUS "Replacing simdcomp with empty stubs for non-x86")
+    file(WRITE "${_sc}/src/simdbitpacking.c" "/* ARM stub: no SSE2 */\n")
+    file(WRITE "${_sc}/src/simdcomputil.c" "/* ARM stub: no SSE2 */\n")
+  endif()
+  set(_simdbp "${CMAKE_CURRENT_SOURCE_DIR}/pisa/src/codec/simdbp.cpp")
+  if(EXISTS "${_simdbp}")
+    message(STATUS "Replacing simdbp.cpp with interpolative fallback for non-x86")
+    file(WRITE "${_simdbp}" [=[
+#include "codec/simdbp.hpp"
+#include "codec/block_codecs.hpp"
+namespace pisa {
+void SimdBpBlockCodec::encode(
+    uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out
+) const {
+    auto* src = const_cast<uint32_t*>(in);
+    interpolative_block::encode(src, sum_of_values, n, out);
+}
+uint8_t const*
+SimdBpBlockCodec::decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n) const {
+    return interpolative_block::decode(in, out, sum_of_values, n);
+}
+}  // namespace pisa
+]=])
+  endif()
+endif()
+
 add_subdirectory(pisa)
 
 Python_add_library(_pisathon MODULE src/pyterrier_pisa/_pisathon.cpp WITH_SOABI)
