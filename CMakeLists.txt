@@ -21,11 +21,12 @@ set(PISA_ENABLE_BENCHMARKING OFF CACHE BOOL "" FORCE)
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module NumPy)
 include_directories(${Python_NumPy_INCLUDE_DIRS})
 
-# Guard x86-only SIMD headers so PISA compiles on aarch64 as well.
-# These are patches to upstream files that haven't been fixed yet.
+# Guard x86-only SIMD headers/sources so PISA compiles on aarch64 as well.
 foreach(_file
     "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/util/intrinsics.hpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/VarIntG8IU.h")
+    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/VarIntG8IU.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/MaskedVByte/src/varintdecode.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/MaskedVByte/src/varintencode.c")
   if(EXISTS "${_file}")
     file(READ "${_file}" _content)
     if(_content MATCHES "#include <x86intrin\\.h>")
