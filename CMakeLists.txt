@@ -21,12 +21,10 @@ set(PISA_ENABLE_BENCHMARKING OFF CACHE BOOL "" FORCE)
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module NumPy)
 include_directories(${Python_NumPy_INCLUDE_DIRS})
 
-# Guard x86-only SIMD headers/sources so PISA compiles on aarch64 as well.
+# Guard x86-only SIMD headers so PISA compiles on aarch64 as well.
 foreach(_file
     "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/util/intrinsics.hpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/VarIntG8IU.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/MaskedVByte/src/varintdecode.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/MaskedVByte/src/varintencode.c")
+    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/VarIntG8IU.h")
   if(EXISTS "${_file}")
     file(READ "${_file}" _content)
     if(_content MATCHES "#include <x86intrin\\.h>")
@@ -39,6 +37,102 @@ foreach(_file
     endif()
   endif()
 endforeach()
+
+# On non-x86, replace MaskedVByte sources with portable scalar VByte implementations.
+# MaskedVByte uses SSE4.1/AVX2 SIMD that does not exist on aarch64.
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(amd64)|(AMD64)")
+  set(_mb "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/MaskedVByte")
+  if(IS_DIRECTORY "${_mb}")
+    message(STATUS "Replacing MaskedVByte with portable scalar implementation for non-x86")
+    file(WRITE "${_mb}/src/varintdecode.c" [=[
+#include <stdint.h>
+#include <stddef.h>
+#include "../include/varintdecode.h"
+size_t masked_vbyte_decode(const uint8_t *in, uint32_t *out, uint64_t length) {
+    size_t pos = 0;
+    for (uint64_t i = 0; i < length; i++) {
+        uint32_t v = 0; int s = 0;
+        while (in[pos] & 0x80) { v |= (uint32_t)(in[pos++] & 0x7F) << s; s += 7; }
+        out[i] = v | ((uint32_t)in[pos++] << s);
+    }
+    return pos;
+}
+size_t masked_vbyte_decode_delta(const uint8_t *in, uint32_t *out, uint64_t length, uint32_t prev) {
+    size_t pos = 0;
+    for (uint64_t i = 0; i < length; i++) {
+        uint32_t v = 0; int s = 0;
+        while (in[pos] & 0x80) { v |= (uint32_t)(in[pos++] & 0x7F) << s; s += 7; }
+        v |= (uint32_t)in[pos++] << s;
+        prev += v; out[i] = prev;
+    }
+    return pos;
+}
+size_t masked_vbyte_decode_fromcompressedsize(const uint8_t *in, uint32_t *out, size_t inputsize) {
+    size_t pos = 0, n = 0;
+    while (pos < inputsize) {
+        uint32_t v = 0; int s = 0;
+        while (in[pos] & 0x80) { v |= (uint32_t)(in[pos++] & 0x7F) << s; s += 7; }
+        out[n++] = v | ((uint32_t)in[pos++] << s);
+    }
+    return n;
+}
+size_t masked_vbyte_decode_fromcompressedsize_delta(const uint8_t *in, uint32_t *out, size_t inputsize, uint32_t prev) {
+    size_t pos = 0, n = 0;
+    while (pos < inputsize) {
+        uint32_t v = 0; int s = 0;
+        while (in[pos] & 0x80) { v |= (uint32_t)(in[pos++] & 0x7F) << s; s += 7; }
+        v |= (uint32_t)in[pos++] << s;
+        prev += v; out[n++] = prev;
+    }
+    return n;
+}
+uint32_t masked_vbyte_select_delta(const uint8_t *in, uint64_t length, uint32_t prev, size_t slot) {
+    size_t pos = 0;
+    for (uint64_t i = 0; i <= slot && i < length; i++) {
+        uint32_t v = 0; int s = 0;
+        while (in[pos] & 0x80) { v |= (uint32_t)(in[pos++] & 0x7F) << s; s += 7; }
+        v |= (uint32_t)in[pos++] << s;
+        prev += v;
+    }
+    return prev;
+}
+int masked_vbyte_search_delta(const uint8_t *in, uint64_t length, uint32_t prev, uint32_t key, uint32_t *presult) {
+    size_t pos = 0;
+    for (uint64_t i = 0; i < length; i++) {
+        uint32_t v = 0; int s = 0;
+        while (in[pos] & 0x80) { v |= (uint32_t)(in[pos++] & 0x7F) << s; s += 7; }
+        v |= (uint32_t)in[pos++] << s;
+        prev += v;
+        if (prev >= key) { *presult = prev; return (int)i; }
+    }
+    return -1;
+}
+]=])
+    file(WRITE "${_mb}/src/varintencode.c" [=[
+#include <stdint.h>
+#include <stddef.h>
+#include "../include/varintencode.h"
+size_t vbyte_encode(uint32_t *in, size_t length, uint8_t *bout) {
+    size_t pos = 0;
+    for (size_t i = 0; i < length; i++) {
+        uint32_t v = in[i];
+        while (v > 0x7F) { bout[pos++] = (uint8_t)((v & 0x7F) | 0x80); v >>= 7; }
+        bout[pos++] = (uint8_t)v;
+    }
+    return pos;
+}
+size_t vbyte_encode_delta(uint32_t *in, size_t length, uint8_t *bout, uint32_t prev) {
+    size_t pos = 0;
+    for (size_t i = 0; i < length; i++) {
+        uint32_t v = in[i] - prev; prev = in[i];
+        while (v > 0x7F) { bout[pos++] = (uint8_t)((v & 0x7F) | 0x80); v >>= 7; }
+        bout[pos++] = (uint8_t)v;
+    }
+    return pos;
+}
+]=])
+  endif()
+endif()
 
 add_subdirectory(pisa)
 
