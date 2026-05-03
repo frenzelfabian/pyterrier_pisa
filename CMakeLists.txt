@@ -163,6 +163,63 @@ SimdBpBlockCodec::decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_value
 }  // namespace pisa
 ]=])
   endif()
+
+  # FastPFor uses SSE2/AVX2 intrinsics (immintrin.h) that don't exist on aarch64.
+  # Replace the three compiled bitpacking source files with empty stubs so the
+  # FastPFor STATIC library target compiles, then replace the PISA codec files
+  # that use FastPFor types with interpolative fallbacks.
+  set(_fp "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/FastPFor")
+  if(IS_DIRECTORY "${_fp}")
+    message(STATUS "Replacing FastPFor compiled sources with empty stubs for non-x86")
+    foreach(_f "bitpackingaligned" "bitpacking" "bitpackingunaligned")
+      file(WRITE "${_fp}/src/${_f}.cpp" "/* ARM stub: no SSE2/AVX2 */\n")
+    endforeach()
+  endif()
+  set(_optpfor_hpp "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/optpfor.hpp")
+  if(EXISTS "${_optpfor_hpp}")
+    message(STATUS "Replacing optpfor.hpp with ARM-safe stub for non-x86")
+    file(WRITE "${_optpfor_hpp}" [=[
+#pragma once
+#include <vector>
+#include "codec/block_codec.hpp"
+namespace pisa {
+class OptPForBlockCodec: public BlockCodec {
+    static const uint64_t m_block_size = 128;
+  public:
+    constexpr static std::string_view name = "block_optpfor";
+    virtual ~OptPForBlockCodec() = default;
+    void encode(uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out) const override;
+    uint8_t const* decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n) const override;
+    auto block_size() const noexcept -> std::size_t override { return m_block_size; }
+    auto get_name() const noexcept -> std::string_view override { return name; }
+};
+}  // namespace pisa
+]=])
+  endif()
+  foreach(_codec "optpfor;OptPForBlockCodec;optpfor" "simple8b;Simple8bBlockCodec;simple8b" "simple16;Simple16BlockCodec;simple16")
+    list(GET _codec 0 _name)
+    list(GET _codec 1 _classname)
+    list(GET _codec 2 _hdr)
+    set(_f "${CMAKE_CURRENT_SOURCE_DIR}/pisa/src/codec/${_name}.cpp")
+    if(EXISTS "${_f}")
+      message(STATUS "Replacing ${_name}.cpp with interpolative fallback for non-x86")
+      file(WRITE "${_f}" "#include \"codec/${_hdr}.hpp\"\n#include \"codec/block_codecs.hpp\"\nnamespace pisa {\nvoid ${_classname}::encode(uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out) const {\n    auto* src = const_cast<uint32_t*>(in);\n    interpolative_block::encode(src, sum_of_values, n, out);\n}\nuint8_t const* ${_classname}::decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n) const {\n    return interpolative_block::decode(in, out, sum_of_values, n);\n}\n}  // namespace pisa\n")
+    endif()
+  endforeach()
+
+  # QMX uses SSE4.1/SSE4.2 intrinsics. Replace its CMakeLists.txt with a no-op
+  # INTERFACE library so the target exists without compiling any SIMD sources,
+  # and replace qmx.cpp with an interpolative fallback.
+  set(_qmx_dir "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/QMX")
+  if(IS_DIRECTORY "${_qmx_dir}")
+    message(STATUS "Replacing QMX with empty INTERFACE library for non-x86")
+    file(WRITE "${_qmx_dir}/CMakeLists.txt" "add_library(QMX INTERFACE)\n")
+  endif()
+  set(_qmx_cpp "${CMAKE_CURRENT_SOURCE_DIR}/pisa/src/codec/qmx.cpp")
+  if(EXISTS "${_qmx_cpp}")
+    message(STATUS "Replacing qmx.cpp with interpolative fallback for non-x86")
+    file(WRITE "${_qmx_cpp}" "#include \"codec/qmx.hpp\"\n#include \"codec/block_codecs.hpp\"\nnamespace pisa {\nvoid QmxBlockCodec::encode(uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out) const {\n    auto* src = const_cast<uint32_t*>(in);\n    interpolative_block::encode(src, sum_of_values, n, out);\n}\nuint8_t const* QmxBlockCodec::decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n) const {\n    return interpolative_block::decode(in, out, sum_of_values, n);\n}\n}  // namespace pisa\n")
+  endif()
 endif()
 
 add_subdirectory(pisa)
