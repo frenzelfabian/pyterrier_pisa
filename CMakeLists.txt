@@ -471,5 +471,10 @@ add_subdirectory(pisa)
 
 Python_add_library(_pisathon MODULE src/pyterrier_pisa/_pisathon.cpp WITH_SOABI)
 target_link_libraries(_pisathon PRIVATE pisa)
+# GSL is a submodule include path that pisa itself doesn't expose — but
+# _pisathon.cpp `#include <gsl/span>`. Add it explicitly for our target.
+target_include_directories(_pisathon PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/GSL/include
+)
 
 install(TARGETS _pisathon DESTINATION pyterrier_pisa)
