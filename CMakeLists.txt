@@ -295,6 +295,7 @@ class OptPForBlockCodec: public BlockCodec {
       "optpfor:OptPForBlockCodec:optpfor"
       "simple8b:Simple8bBlockCodec:simple8b"
       "simple16:Simple16BlockCodec:simple16"
+      "varint_g8iu:VarintG8IUBlockCodec:varint_g8iu"
   )
   foreach(_spec IN LISTS _codec_specs)
     string(REGEX MATCHALL "[^:]+" _parts "${_spec}")
