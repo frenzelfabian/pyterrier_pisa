@@ -111,6 +111,127 @@ _pisa_strip_march_native("${CMAKE_CURRENT_SOURCE_DIR}/pisa/CMakeLists.txt")
 _pisa_strip_march_native("${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/CMakeLists.txt")
 
 # ---------------------------------------------------------------------------
+# Restore TermProcessor (deleted upstream by pisa commit 10dfbd74 "Query
+# refactoring"). Our pinned pisa commit is past that deletion, but our
+# `src/pyterrier_pisa/_pisathon.cpp` still depends on `pisa::TermProcessor`
+# and `term_transformer_builder`. Reintroduce the original sources so they
+# compile against the rest of the (newer) pisa API. Header and cpp content
+# below are taken verbatim from pisa commit 10dfbd74^.
+#
+# Restored unconditionally — needed on every architecture, not arch-specific.
+# ---------------------------------------------------------------------------
+_pisa_write_if_changed(
+    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/query/term_processor.hpp"
+    [=[#pragma once
+
+#include <functional>
+#include <optional>
+#include <unordered_set>
+
+#include "io.hpp"
+#include "memory_source.hpp"
+#include "payload_vector.hpp"
+
+namespace pisa {
+
+using term_id_type = uint32_t;
+using TermTransformer = std::function<std::string(std::string)>;
+using TermTransformerBuilder = std::function<TermTransformer()>;
+
+auto term_transformer_builder(std::optional<std::string> const& type) -> TermTransformerBuilder;
+
+class TermProcessor {
+  private:
+    std::unordered_set<term_id_type> stopwords;
+
+    // Method implemented in constructor according to the specified stemmer.
+    std::function<std::optional<term_id_type>(std::string)> _to_id;
+
+  public:
+    TermProcessor(
+        std::optional<std::string> const& terms_file,
+        std::optional<std::string> const& stopwords_filename,
+        std::optional<std::string> const& stemmer_type
+    ) {
+        auto source = std::make_shared<MemorySource>(MemorySource::mapped_file(*terms_file));
+        auto terms = Payload_Vector<>::from(*source);
+        auto to_id = [source = std::move(source), terms](auto str) -> std::optional<term_id_type> {
+            // Note: the lexicographical order of the terms matters.
+            return pisa::binary_search(terms.begin(), terms.end(), std::string_view(str));
+        };
+
+        // Implements '_to_id' method.
+        _to_id = [=](auto str) { return to_id(term_transformer_builder(stemmer_type)()(str)); };
+        // Loads stopwords.
+        if (stopwords_filename) {
+            std::ifstream is(*stopwords_filename);
+            io::for_each_line(is, [&](auto&& word) {
+                if (auto processed_term = _to_id(std::move(word)); processed_term.has_value()) {
+                    stopwords.insert(*processed_term);
+                }
+            });
+        }
+    }
+
+    std::optional<term_id_type> operator()(std::string token) { return _to_id(token); }
+
+    bool is_stopword(const term_id_type term) { return stopwords.find(term) != stopwords.end(); }
+
+    std::vector<term_id_type> get_stopwords() {
+        std::vector<term_id_type> v;
+        v.insert(v.end(), stopwords.begin(), stopwords.end());
+        sort(v.begin(), v.end());
+        return v;
+    }
+};
+
+}  // namespace pisa
+]=])
+
+_pisa_write_if_changed(
+    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/src/query/term_processor.cpp"
+    [=[#include "query/term_processor.hpp"
+
+#include <KrovetzStemmer/KrovetzStemmer.hpp>
+#include <Porter2.hpp>
+#include <boost/algorithm/string.hpp>
+#include <fmt/format.h>
+
+namespace pisa {
+
+auto term_transformer_builder(std::optional<std::string> const& type) -> TermTransformerBuilder {
+    if (not type) {
+        return [] {
+            return [](std::string&& term) -> std::string {
+                boost::algorithm::to_lower(term);
+                return std::move(term);
+            };
+        };
+    }
+    if (*type == "porter2") {
+        return [] {
+            return [](std::string&& term) -> std::string {
+                boost::algorithm::to_lower(term);
+                return porter2::Stemmer{}.stem(term);
+            };
+        };
+    }
+    if (*type == "krovetz") {
+        return []() {
+            return [kstemmer = std::make_shared<stem::KrovetzStemmer>()](std::string&& term
+                   ) mutable -> std::string {
+                boost::algorithm::to_lower(term);
+                return kstemmer->kstem_stemmer(term);
+            };
+        };
+    }
+    throw std::invalid_argument(fmt::format("Unknown stemmer type: {}", *type));
+};
+
+}  // namespace pisa
+]=])
+
+# ---------------------------------------------------------------------------
 # Architecture-specific source replacements (non-x86 only)
 #
 # On aarch64, several SIMD libraries don't compile because they rely on x86
