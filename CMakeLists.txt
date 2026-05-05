@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.15)
 
 project(${SKBUILD_PROJECT_NAME} LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS ON)
 
@@ -11,8 +11,7 @@ set(CMAKE_CXX_EXTENSIONS ON)
 # these flags must cover everything the C and C++ submodule sources need:
 # MaskedVByte's varintdecode.c uses SSE3/SSSE3/SSE4.1 intrinsics, simdcomp
 # uses SSE2, FastPFor uses SSE2/AVX2. `-msse4.2` implies SSE3/SSSE3/SSE4.1,
-# so the bundle below covers all of them. CRITICAL: set both C and CXX flags;
-# C-only flag was the missing piece in the previous iteration.
+# so the bundle below covers all of them. CRITICAL: set both C and CXX flags.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64)|(amd64)|(AMD64)")
     set(_PISA_ARCH_X86 ON)
     set(_pisa_x86_flags "-mtune=generic -march=x86-64 -msse4.2 -mavx -mavx2 -mfma -mbmi -mpopcnt")
@@ -37,16 +36,15 @@ include_directories(${Python_NumPy_INCLUDE_DIRS})
 # ---------------------------------------------------------------------------
 # Idempotent patching helpers
 #
-# The submodule pisa/ ships sources that assume x86 (SSE/AVX intrinsics).
-# To make builds work on aarch64 we patch a few headers/sources at configure
-# time. These patches MUST be idempotent: CMake reconfigures repeatedly
-# during builds, and a non-idempotent patch ends up nesting guards or
-# bumping file mtimes on every run, which triggers spurious rebuilds and,
-# in some cases, slowly corrupts the file.
+# The pinned pisa submodule (0782913a) is a header-only-codec era of pisa
+# whose APIs match _pisathon.cpp. To make it build on aarch64 we patch a few
+# headers and external libs at configure time. Patches MUST be idempotent:
+# CMake reconfigures repeatedly during builds; non-idempotent patches end
+# up nesting guards or bumping mtimes on every run, which triggers spurious
+# rebuilds and slowly corrupts files.
 # ---------------------------------------------------------------------------
 
-# Write `_content` to `_path` only if the existing file differs. Avoids
-# bumping mtimes on every reconfigure.
+# Write `_content` to `_path` only if the existing file differs.
 function(_pisa_write_if_changed _path _content)
     set(_existing "")
     if(EXISTS "${_path}")
@@ -59,8 +57,7 @@ function(_pisa_write_if_changed _path _content)
 endfunction()
 
 # Wrap `#include <x86intrin.h>` in an architecture guard. Idempotent: looks
-# at the bytes preceding the include and skips if `__x86_64__` already guards
-# it.
+# at the bytes preceding the include and skips if `__x86_64__` already guards it.
 function(_pisa_guard_x86intrin _file)
     if(NOT EXISTS "${_file}")
         return()
@@ -72,7 +69,6 @@ function(_pisa_guard_x86intrin _file)
     endif()
     string(SUBSTRING "${_content}" 0 ${_inc_pos} _before)
     if(_before MATCHES "defined\\(__x86_64__\\)")
-        # Already guarded — nothing to do.
         return()
     endif()
     string(REGEX REPLACE
@@ -84,9 +80,6 @@ function(_pisa_guard_x86intrin _file)
 endfunction()
 
 # Drop unconditional `-march=native` lines from the submodule CMakeLists files.
-# The parent already sets portable arch flags above; `-march=native` overrides
-# them and breaks reproducible/portable builds. Idempotent: if no match found,
-# nothing is rewritten.
 function(_pisa_strip_march_native _file)
     if(NOT EXISTS "${_file}")
         return()
@@ -102,7 +95,7 @@ function(_pisa_strip_march_native _file)
     endif()
 endfunction()
 
-# Apply x86intrin guards.
+# Apply x86intrin guards (harmless on x86, useful on ARM).
 _pisa_guard_x86intrin("${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/util/intrinsics.hpp")
 _pisa_guard_x86intrin("${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/VarIntG8IU.h")
 
@@ -111,136 +104,36 @@ _pisa_strip_march_native("${CMAKE_CURRENT_SOURCE_DIR}/pisa/CMakeLists.txt")
 _pisa_strip_march_native("${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/CMakeLists.txt")
 
 # ---------------------------------------------------------------------------
-# Restore TermProcessor (deleted upstream by pisa commit 10dfbd74 "Query
-# refactoring"). Our pinned pisa commit is past that deletion, but our
-# `src/pyterrier_pisa/_pisathon.cpp` still depends on `pisa::TermProcessor`
-# and `term_transformer_builder`. Reintroduce the original sources so they
-# compile against the rest of the (newer) pisa API. Header and cpp content
-# below are taken verbatim from pisa commit 10dfbd74^.
-#
-# Restored unconditionally — needed on every architecture, not arch-specific.
+# Patch recursive_graph_bisection.hpp's expb() function. It uses SSE intrinsics
+# to compute four products in parallel; on ARM we replace with a scalar
+# equivalent that produces the same value (deg1*logn1 - deg1*log2(deg1+1) +
+# deg2*logn2 - deg2*log2(deg2+1)). Applied unconditionally for both archs:
+# the scalar version is correct on x86 too, just marginally slower.
 # ---------------------------------------------------------------------------
-_pisa_write_if_changed(
-    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/query/term_processor.hpp"
-    [=[#pragma once
-
-#include <functional>
-#include <optional>
-#include <unordered_set>
-
-#include "io.hpp"
-#include "memory_source.hpp"
-#include "payload_vector.hpp"
-
-namespace pisa {
-
-using term_id_type = uint32_t;
-using TermTransformer = std::function<std::string(std::string)>;
-using TermTransformerBuilder = std::function<TermTransformer()>;
-
-auto term_transformer_builder(std::optional<std::string> const& type) -> TermTransformerBuilder;
-
-class TermProcessor {
-  private:
-    std::unordered_set<term_id_type> stopwords;
-
-    // Method implemented in constructor according to the specified stemmer.
-    std::function<std::optional<term_id_type>(std::string)> _to_id;
-
-  public:
-    TermProcessor(
-        std::optional<std::string> const& terms_file,
-        std::optional<std::string> const& stopwords_filename,
-        std::optional<std::string> const& stemmer_type
-    ) {
-        auto source = std::make_shared<MemorySource>(MemorySource::mapped_file(*terms_file));
-        auto terms = Payload_Vector<>::from(*source);
-        auto to_id = [source = std::move(source), terms](auto str) -> std::optional<term_id_type> {
-            // Note: the lexicographical order of the terms matters.
-            return pisa::binary_search(terms.begin(), terms.end(), std::string_view(str));
-        };
-
-        // Implements '_to_id' method.
-        _to_id = [=](auto str) { return to_id(term_transformer_builder(stemmer_type)()(str)); };
-        // Loads stopwords.
-        if (stopwords_filename) {
-            std::ifstream is(*stopwords_filename);
-            io::for_each_line(is, [&](auto&& word) {
-                if (auto processed_term = _to_id(std::move(word)); processed_term.has_value()) {
-                    stopwords.insert(*processed_term);
-                }
-            });
-        }
-    }
-
-    std::optional<term_id_type> operator()(std::string token) { return _to_id(token); }
-
-    bool is_stopword(const term_id_type term) { return stopwords.find(term) != stopwords.end(); }
-
-    std::vector<term_id_type> get_stopwords() {
-        std::vector<term_id_type> v;
-        v.insert(v.end(), stopwords.begin(), stopwords.end());
-        sort(v.begin(), v.end());
-        return v;
-    }
-};
-
-}  // namespace pisa
-]=])
-
-_pisa_write_if_changed(
-    "${CMAKE_CURRENT_SOURCE_DIR}/pisa/src/query/term_processor.cpp"
-    [=[#include "query/term_processor.hpp"
-
-#include <KrovetzStemmer/KrovetzStemmer.hpp>
-#include <Porter2.hpp>
-#include <boost/algorithm/string.hpp>
-#include <fmt/format.h>
-
-namespace pisa {
-
-auto term_transformer_builder(std::optional<std::string> const& type) -> TermTransformerBuilder {
-    if (not type) {
-        return [] {
-            return [](std::string&& term) -> std::string {
-                boost::algorithm::to_lower(term);
-                return std::move(term);
-            };
-        };
-    }
-    if (*type == "porter2") {
-        return [] {
-            return [](std::string&& term) -> std::string {
-                boost::algorithm::to_lower(term);
-                return porter2::Stemmer{}.stem(term);
-            };
-        };
-    }
-    if (*type == "krovetz") {
-        return []() {
-            return [kstemmer = std::make_shared<stem::KrovetzStemmer>()](std::string&& term
-                   ) mutable -> std::string {
-                boost::algorithm::to_lower(term);
-                return kstemmer->kstem_stemmer(term);
-            };
-        };
-    }
-    throw std::invalid_argument(fmt::format("Unknown stemmer type: {}", *type));
-};
-
-}  // namespace pisa
-]=])
+set(_rgb_file "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/recursive_graph_bisection.hpp")
+if(EXISTS "${_rgb_file}")
+    file(READ "${_rgb_file}" _rgb_content)
+    if(_rgb_content MATCHES "__m128 _deg")
+        # Greedy `[^@]*` matches across newlines (no DOTALL in CMake regex).
+        string(REGEX REPLACE
+            "__m128 _deg[^@]*return a\\[3\\] - a\\[2\\] \\+ a\\[1\\] - a\\[0\\];"
+            "/* PISA_ARM_PATCH: scalar replacement for SSE expb() */ return double(deg1) * logn1 - double(deg1) * log2(deg1 + 1) + double(deg2) * logn2 - double(deg2) * log2(deg2 + 1);"
+            _rgb_new "${_rgb_content}")
+        if(NOT _rgb_new STREQUAL _rgb_content)
+            file(WRITE "${_rgb_file}" "${_rgb_new}")
+            message(STATUS "pyterrier_pisa: scalar expb() applied to ${_rgb_file}")
+        endif()
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
-# Architecture-specific source replacements (non-x86 only)
+# Architecture-specific patches (aarch64 only)
 #
-# On aarch64, several SIMD libraries don't compile because they rely on x86
-# intrinsics (SSE/AVX). For each, we replace the offending sources with a
-# portable fallback (or empty stub if the symbols aren't actually called).
-# All writes go through _pisa_write_if_changed for idempotency.
+# Three header replacements + four external-lib stubs. After this block the
+# pisa source tree contains zero x86 intrinsic uses on aarch64.
 # ---------------------------------------------------------------------------
 if(NOT _PISA_ARCH_X86)
-  # MaskedVByte: SSE4.1/AVX2 → portable scalar VByte.
+  # External lib: MaskedVByte (SSE4.1/AVX2) → portable scalar VByte.
   set(_mb "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/MaskedVByte")
   if(IS_DIRECTORY "${_mb}")
     _pisa_write_if_changed("${_mb}/src/varintdecode.c" [=[
@@ -334,28 +227,25 @@ size_t vbyte_encode_delta(uint32_t *in, size_t length, uint8_t *bout, uint32_t p
 ]=])
   endif()
 
-  # simdcomp: SSE2 (__m128i) → empty stubs (symbols aren't reached on ARM
-  # because SimdBpBlockCodec is replaced below with an interpolative fallback).
+  # External lib: simdcomp (SSE2 __m128i) → empty stubs. simdbp.hpp below
+  # routes around the simdcomp symbols entirely on aarch64.
   set(_sc "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/simdcomp")
   if(IS_DIRECTORY "${_sc}")
     _pisa_write_if_changed("${_sc}/src/simdbitpacking.c" "/* PISA_ARM_STUB: no SSE2 */\n")
     _pisa_write_if_changed("${_sc}/src/simdcomputil.c" "/* PISA_ARM_STUB: no SSE2 */\n")
   endif()
 
-  # FastPFor: SSE2/AVX2 (immintrin.h) — none of its sources can compile on
-  # aarch64. Replace its CMakeLists with a minimal stub that creates an empty
-  # STATIC library exposing only the headers directory, so dependents that
-  # link against FastPFor and `target_compile_options(FastPFor PRIVATE ...)`
-  # in pisa/external/CMakeLists.txt still work. PISA's own codec sources that
-  # would call into FastPFor are themselves replaced below with interpolative
-  # fallbacks, so the empty library has no callers.
+  # External lib: FastPFor — replace its CMakeLists with a minimal stub. None
+  # of FastPFor's sources can compile on aarch64 (immintrin.h SSE2/AVX2). The
+  # stubbed STATIC lib has one empty translation unit so dependents that link
+  # against it still work; the headers directory is exposed so the (now unused)
+  # FastPFor headers remain reachable for include resolution.
   set(_fp "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/FastPFor")
   if(IS_DIRECTORY "${_fp}")
     _pisa_write_if_changed("${_fp}/fastpfor_arm_stub.cpp"
         "/* PISA_ARM_STUB: empty translation unit so FastPFor STATIC has at least one source. */\n")
     _pisa_write_if_changed("${_fp}/CMakeLists.txt" [=[
-# PISA_ARM_STUB: replaces upstream FastPFor CMakeLists on aarch64 because all
-# of the bitpacking sources require x86 SIMD intrinsics (immintrin.h).
+# PISA_ARM_STUB: replaces upstream FastPFor CMakeLists on aarch64.
 cmake_minimum_required(VERSION 3.5)
 project(FastPFor CXX)
 add_library(FastPFor STATIC fastpfor_arm_stub.cpp)
@@ -363,106 +253,272 @@ target_include_directories(FastPFor PUBLIC headers)
 ]=])
   endif()
 
-  # PISA codec sources that depend on the SIMD libs above. Replace each with
-  # an interpolative fallback so the symbols still link.
-  _pisa_write_if_changed(
-      "${CMAKE_CURRENT_SOURCE_DIR}/pisa/src/codec/simdbp.cpp"
-      [=[
-/* PISA_ARM_STUB: interpolative fallback for SimdBpBlockCodec. */
-#include "codec/simdbp.hpp"
-#include "codec/block_codecs.hpp"
-namespace pisa {
-void SimdBpBlockCodec::encode(
-    uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out
-) const {
-    auto* src = const_cast<uint32_t*>(in);
-    interpolative_block::encode(src, sum_of_values, n, out);
-}
-uint8_t const*
-SimdBpBlockCodec::decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n) const {
-    return interpolative_block::decode(in, out, sum_of_values, n);
-}
-}  // namespace pisa
-]=])
-
-  # OptPFor's header pulls in FastPFor types. Replace with an ARM-safe stub
-  # whose .cpp uses an interpolative fallback.
-  _pisa_write_if_changed(
-      "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/optpfor.hpp"
-      [=[
-/* PISA_ARM_STUB: header without FastPFor SIMD dependency. */
-#pragma once
-#include <vector>
-#include "codec/block_codec.hpp"
-namespace pisa {
-class OptPForBlockCodec: public BlockCodec {
-    static const uint64_t m_block_size = 128;
-  public:
-    constexpr static std::string_view name = "block_optpfor";
-    virtual ~OptPForBlockCodec() = default;
-    void encode(uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out) const override;
-    uint8_t const* decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n) const override;
-    auto block_size() const noexcept -> std::size_t override { return m_block_size; }
-    auto get_name() const noexcept -> std::string_view override { return name; }
-};
-}  // namespace pisa
-]=])
-
-  # Codec .cpp files that compile against the now-stubbed SIMD libs. Each is
-  # replaced with an interpolative fallback. Format: "name:class:header" —
-  # using ':' as the inner separator because CMake list semantics flatten
-  # nested ';' lists.
-  set(_codec_specs
-      "optpfor:OptPForBlockCodec:optpfor"
-      "simple8b:Simple8bBlockCodec:simple8b"
-      "simple16:Simple16BlockCodec:simple16"
-      "varint_g8iu:VarintG8IUBlockCodec:varint_g8iu"
-  )
-  foreach(_spec IN LISTS _codec_specs)
-    string(REGEX MATCHALL "[^:]+" _parts "${_spec}")
-    list(GET _parts 0 _name)
-    list(GET _parts 1 _classname)
-    list(GET _parts 2 _hdr)
-    set(_target "${CMAKE_CURRENT_SOURCE_DIR}/pisa/src/codec/${_name}.cpp")
-    set(_codec_body
-"/* PISA_ARM_STUB: interpolative fallback for ${_classname}. */
-#include \"codec/${_hdr}.hpp\"
-#include \"codec/block_codecs.hpp\"
-namespace pisa {
-void ${_classname}::encode(uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out) const {
-    auto* src = const_cast<uint32_t*>(in);
-    interpolative_block::encode(src, sum_of_values, n, out);
-}
-uint8_t const* ${_classname}::decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n) const {
-    return interpolative_block::decode(in, out, sum_of_values, n);
-}
-}  // namespace pisa
-")
-    _pisa_write_if_changed("${_target}" "${_codec_body}")
-  endforeach()
-
-  # QMX uses SSE4.1/SSE4.2 intrinsics. Replace its CMakeLists with a no-op
-  # INTERFACE library so the target exists without compiling SIMD sources,
-  # then replace qmx.cpp with an interpolative fallback.
+  # External lib: QMX (SSE4.1/SSE4.2) → empty INTERFACE library.
   set(_qmx_dir "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/QMX")
   if(IS_DIRECTORY "${_qmx_dir}")
     _pisa_write_if_changed("${_qmx_dir}/CMakeLists.txt"
         "# PISA_ARM_STUB: no SSE4 on aarch64\nadd_library(QMX INTERFACE)\n")
   endif()
+
+  # PISA header: VarIntG8IU.h is only included by block_codecs.hpp (which we
+  # also rewrite below). Replace with a minimal stub class so any stray
+  # transitive inclusion still parses on aarch64.
   _pisa_write_if_changed(
-      "${CMAKE_CURRENT_SOURCE_DIR}/pisa/src/codec/qmx.cpp"
-      [=[
-/* PISA_ARM_STUB: interpolative fallback for QmxBlockCodec. */
-#include "codec/qmx.hpp"
-#include "codec/block_codecs.hpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/VarIntG8IU.h"
+      [=[/* PISA_ARM_STUB: SIMD-free placeholder; real implementation requires SSE3/SSE4.1. */
+#pragma once
+#include <cstdint>
+#include <vector>
 namespace pisa {
-void QmxBlockCodec::encode(uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out) const {
-    auto* src = const_cast<uint32_t*>(in);
-    interpolative_block::encode(src, sum_of_values, n, out);
-}
-uint8_t const* QmxBlockCodec::decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n) const {
-    return interpolative_block::decode(in, out, sum_of_values, n);
-}
+class VarIntG8IU {
+  public:
+    VarIntG8IU() = default;
+    ~VarIntG8IU() = default;
+};
+}  // namespace pisa
+]=])
+
+  # PISA header: simdbp.hpp — replace simdbp_block with an interpolative-only
+  # version (real version uses simdcomp's __m128i intrinsics).
+  _pisa_write_if_changed(
+      "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/simdbp.hpp"
+      [=[/* PISA_ARM_STUB: simdbp_block routed through interpolative_block. */
+#pragma once
+
+#include "codec/block_codecs.hpp"
+#include <cstdint>
+#include <vector>
+
+namespace pisa {
+struct simdbp_block {
+    static const uint64_t block_size = 128;
+    static void encode(uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out)
+    {
+        interpolative_block::encode(in, sum_of_values, n, out);
+    }
+    static uint8_t const* decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n)
+    {
+        return interpolative_block::decode(in, out, sum_of_values, n);
+    }
+};
+}  // namespace pisa
+]=])
+
+  # PISA header: block_codecs.hpp — full rewrite.
+  # The upstream version pulls in FastPFor/optpfor.h (→ common.h → immintrin.h)
+  # and uses __m128i directly inside varint_G8IU_block::codec_type. We replace
+  # the entire file with a slim version that keeps TightVariableByte and
+  # interpolative_block verbatim and replaces optpfor_block / varint_G8IU_block
+  # with interpolative-only stubs.
+  _pisa_write_if_changed(
+      "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/block_codecs.hpp"
+      [=[/* PISA_ARM_STUB: SIMD-free block_codecs for aarch64. */
+#pragma once
+
+#include <array>
+#include <cassert>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <vector>
+
+#include "codec/integer_codes.hpp"
+#include "codec/interpolative_coding.hpp"
+#include "util/compiler_attribute.hpp"
+#include "util/likely.hpp"
+#include "util/util.hpp"
+
+namespace pisa {
+
+// VariableByte::decodeArray needs the buffer size, while we only know the
+// number of values. It also pads to 32 bits. We need to rewrite.
+class TightVariableByte {
+  public:
+    template <uint32_t i>
+    static uint8_t extract7bits(const uint32_t val)
+    {
+        return static_cast<uint8_t>((val >> (7 * i)) & ((1U << 7) - 1));
+    }
+
+    template <uint32_t i>
+    static uint8_t extract7bitsmaskless(const uint32_t val)
+    {
+        return static_cast<uint8_t>(val >> (7 * i));
+    }
+
+    static void encode(const uint32_t* in, const size_t length, uint8_t* out, size_t& nvalue)
+    {
+        uint8_t* bout = out;
+        for (size_t k = 0; k < length; ++k) {
+            const uint32_t val = in[k];
+            if (val < (1U << 7)) {
+                *bout = val | 0x80U;
+                ++bout;
+            } else if (val < (1U << 14)) {
+                *bout = extract7bits<0>(val);
+                ++bout;
+                *bout = extract7bitsmaskless<1>(val) | 0x80U;
+                ++bout;
+            } else if (val < (1U << 21)) {
+                *bout = extract7bits<0>(val);
+                ++bout;
+                *bout = extract7bits<1>(val);
+                ++bout;
+                *bout = extract7bitsmaskless<2>(val) | 0x80U;
+                ++bout;
+            } else if (val < (1U << 28)) {
+                *bout = extract7bits<0>(val);
+                ++bout;
+                *bout = extract7bits<1>(val);
+                ++bout;
+                *bout = extract7bits<2>(val);
+                ++bout;
+                *bout = extract7bitsmaskless<3>(val) | 0x80U;
+                ++bout;
+            } else {
+                *bout = extract7bits<0>(val);
+                ++bout;
+                *bout = extract7bits<1>(val);
+                ++bout;
+                *bout = extract7bits<2>(val);
+                ++bout;
+                *bout = extract7bits<3>(val);
+                ++bout;
+                *bout = extract7bitsmaskless<4>(val) | 0x80U;
+                ++bout;
+            }
+        }
+        nvalue = bout - out;
+    }
+
+    static void encode_single(uint32_t val, std::vector<uint8_t>& out)
+    {
+        uint8_t buf[5];
+        size_t nvalue;
+        encode(&val, 1, buf, nvalue);
+        out.insert(out.end(), buf, buf + nvalue);
+    }
+
+    static uint8_t const* decode(const uint8_t* in, uint32_t* out, size_t n)
+    {
+        const uint8_t* inbyte = in;
+        for (size_t i = 0; i < n; ++i) {
+            unsigned int shift = 0;
+            for (uint32_t v = 0;; shift += 7) {
+                uint8_t c = *inbyte++;
+                v += ((c & 127) << shift);
+                if ((c & 128)) {
+                    *out++ = v;
+                    break;
+                }
+            }
+        }
+        return inbyte;
+    }
+
+    static void decode(const uint8_t* in, uint32_t* out, size_t len, size_t& n)
+    {
+        const uint8_t* inbyte = in;
+        const uint8_t* end = in + len;
+        n = 0;
+        while (inbyte < end) {
+            unsigned int shift = 0;
+            for (uint32_t v = 0;; shift += 7) {
+                uint8_t c = *inbyte++;
+                v += ((c & 127) << shift);
+                if ((c & 128)) {
+                    *out++ = v;
+                    ++n;
+                    break;
+                }
+            }
+        }
+    }
+};
+
+struct interpolative_block {
+    static constexpr std::uint64_t block_size = 128;
+
+    static void encode(uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out)
+    {
+        assert(n <= block_size);
+        thread_local std::array<std::uint32_t, block_size> inbuf{};
+        thread_local std::vector<uint32_t> outbuf;
+        inbuf[0] = *in;
+        for (size_t i = 1; i < n; ++i) {
+            inbuf[i] = inbuf[i - 1] + in[i];
+        }
+
+        if (sum_of_values == uint32_t(-1)) {
+            sum_of_values = inbuf[n - 1];
+            TightVariableByte::encode_single(sum_of_values, out);
+        }
+
+        bit_writer bw(outbuf);
+        bw.write_interpolative(inbuf.data(), n - 1, 0, sum_of_values);
+        auto const* bufptr = reinterpret_cast<uint8_t const*>(outbuf.data());
+        out.insert(out.end(), bufptr, bufptr + ceil_div(bw.size(), 8));
+    }
+
+    static uint8_t const* PISA_NOINLINE
+    decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n)
+    {
+        assert(n <= block_size);
+        if (sum_of_values == std::numeric_limits<std::uint32_t>::max()) {
+            in = TightVariableByte::decode(in, &sum_of_values, 1);
+        }
+
+        out[n - 1] = sum_of_values;
+        size_t read_interpolative = 0;
+        if (n > 1) {
+            bit_reader br(in);
+            br.read_interpolative(out, n - 1, 0, sum_of_values);
+            for (size_t i = n - 1; i > 0; --i) {
+                out[i] -= out[i - 1];
+            }
+            read_interpolative = ceil_div(br.position(), 8);
+        }
+
+        return in + read_interpolative;
+    }
+};
+
+// PISA_ARM_STUB: optpfor_block routed through interpolative_block.
+struct optpfor_block {
+    static const uint64_t block_size = 128;
+
+    static void encode(
+        uint32_t const* in,
+        uint32_t sum_of_values,
+        size_t n,
+        std::vector<uint8_t>& out,
+        uint8_t const* /*b*/ = nullptr)
+    {
+        interpolative_block::encode(in, sum_of_values, n, out);
+    }
+
+    static uint8_t const* PISA_NOINLINE
+    decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n)
+    {
+        return interpolative_block::decode(in, out, sum_of_values, n);
+    }
+};
+
+// PISA_ARM_STUB: varint_G8IU_block routed through interpolative_block.
+struct varint_G8IU_block {
+    static const uint64_t block_size = 128;
+
+    static void encode(uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out)
+    {
+        interpolative_block::encode(in, sum_of_values, n, out);
+    }
+
+    static uint8_t const* decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n)
+    {
+        return interpolative_block::decode(in, out, sum_of_values, n);
+    }
+};
+
 }  // namespace pisa
 ]=])
 endif()
