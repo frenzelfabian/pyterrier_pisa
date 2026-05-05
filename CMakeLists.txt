@@ -235,6 +235,14 @@ size_t vbyte_encode_delta(uint32_t *in, size_t length, uint8_t *bout, uint32_t p
     _pisa_write_if_changed("${_sc}/src/simdcomputil.c" "/* PISA_ARM_STUB: no SSE2 */\n")
   endif()
 
+  # External lib: streamvbyte (SSE/SSSE3 in upstream) → empty stubs.
+  # streamvbyte.hpp below routes around the streamvbyte symbols entirely.
+  set(_svb "${CMAKE_CURRENT_SOURCE_DIR}/pisa/external/streamvbyte")
+  if(IS_DIRECTORY "${_svb}")
+    _pisa_write_if_changed("${_svb}/src/streamvbyte.c" "/* PISA_ARM_STUB: no SSE/SSSE3 */\n")
+    _pisa_write_if_changed("${_svb}/src/streamvbytedelta.c" "/* PISA_ARM_STUB: no SSE/SSSE3 */\n")
+  endif()
+
   # External lib: FastPFor — replace its CMakeLists with a minimal stub. None
   # of FastPFor's sources can compile on aarch64 (immintrin.h SSE2/AVX2). The
   # stubbed STATIC lib has one empty translation unit so dependents that link
@@ -277,6 +285,48 @@ class VarIntG8IU {
 };
 }  // namespace pisa
 ]=])
+
+  # PISA codec headers — each upstream version pulls in an external SIMD lib
+  # (FastPFor/common.h → immintrin.h, QMX with SSE4, streamvbyte). On aarch64
+  # we replace each with an interpolative-only struct that keeps the same
+  # public name and signature so index_types.hpp template instantiations
+  # still resolve.
+  set(_arm_codec_stubs
+      "qmx:qmx_block"
+      "simple8b:simple8b_block"
+      "simple16:simple16_block"
+      "varintgb:varintgb_block"
+      "streamvbyte:streamvbyte_block"
+  )
+  foreach(_spec IN LISTS _arm_codec_stubs)
+    string(REGEX MATCHALL "[^:]+" _parts "${_spec}")
+    list(GET _parts 0 _hdr)
+    list(GET _parts 1 _struct)
+    set(_target "${CMAKE_CURRENT_SOURCE_DIR}/pisa/include/pisa/codec/${_hdr}.hpp")
+    set(_body
+"/* PISA_ARM_STUB: ${_struct} routed through interpolative_block. */
+#pragma once
+
+#include \"codec/block_codecs.hpp\"
+#include <cstdint>
+#include <vector>
+
+namespace pisa {
+struct ${_struct} {
+    static const uint64_t block_size = 128;
+    static void encode(uint32_t const* in, uint32_t sum_of_values, size_t n, std::vector<uint8_t>& out)
+    {
+        interpolative_block::encode(in, sum_of_values, n, out);
+    }
+    static uint8_t const* decode(uint8_t const* in, uint32_t* out, uint32_t sum_of_values, size_t n)
+    {
+        return interpolative_block::decode(in, out, sum_of_values, n);
+    }
+};
+}  // namespace pisa
+")
+    _pisa_write_if_changed("${_target}" "${_body}")
+  endforeach()
 
   # PISA header: simdbp.hpp — replace simdbp_block with an interpolative-only
   # version (real version uses simdcomp's __m128i intrinsics).
